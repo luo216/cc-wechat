@@ -24,6 +24,7 @@ function help(): void {
     patch     修补 Claude Code 以启用 Channels 功能
     unpatch   恢复原始 Claude Code
     login     重新扫码登录
+    daemon    无 tmux 常驻桥（iLink ↔ headless claude，支持内置斜杠命令）
     status    查看连接状态
     help      显示帮助
 `);
@@ -115,6 +116,9 @@ if (!command && !process.stdin.isTTY) {
       await import('./patch.js');
       break;
     }
+    case 'daemon':
+      await import('./daemon.js');
+      break;
     case 'status': status(); break;
     case 'help': case '--help': case '-h': case undefined: help(); break;
     default: console.error(`未知命令: ${command}`); help(); process.exit(1);

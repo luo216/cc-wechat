@@ -55,6 +55,46 @@ Claude Code 的 Channels 功能受服务端灰度控制，部分用户需要 pat
 
 支持发送图片、视频和文件（通过 reply 工具的 media 参数）。
 
+### Daemon 模式（无 tmux，推荐远程编程）
+
+默认的 MCP Channel 模式必须把 Claude Code 跑在 tmux 里，斜杠命令也只能靠按键注入。
+`daemon` 模式改为常驻驱动 headless Claude Code，**不需要 tmux/pty**，内置斜杠命令由 Claude Code 本地执行：
+
+```
+微信 → iLink 长轮询 → cc-wechat daemon → claude -p --input-format stream-json
+                                        ← assistant 文本 → sendmessage
+```
+
+```bash
+# 先登录（复用同一份账号状态）
+cc-wechat login
+
+# 在目标项目目录启动守护进程
+cc-wechat daemon --cwd /path/to/project
+```
+
+- 每个微信消息作为一行 stream-json 用户输入；`/compact`、`/clear`、`/cost`、`/context`、`/model xxx` 等内置命令直接执行（`/status` 等纯 UI 命令不可用）
+- 会话 ID 自动持久化到 `~/.claude/channels/wechat/<profile>/claude-session.json`，进程重启后自动 `--resume`
+- headless 无法回答权限提示，因此以 `--permission-mode bypassPermissions` 启动
+- 同一 bot token 只能有一个轮询进程：daemon 运行期间不要再启动 MCP 模式会话
+- 想看实时过程：先停 daemon，再 `claude --resume <sessionId>`（同一会话不要双写）
+
+systemd user service 示例（`cc-wechat-daemon.service`）：
+
+```ini
+[Unit]
+Description=cc-wechat daemon (WeChat ↔ Claude Code)
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/env node /path/to/cc-wechat/dist/cli.js daemon --cwd /path/to/project
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+```
+
 ### 重新登录
 
     npx cc-wechat login
