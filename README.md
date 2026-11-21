@@ -79,6 +79,22 @@ cc-wechat daemon --cwd /path/to/project
 - 同一 bot token 只能有一个轮询进程：daemon 运行期间不要再启动 MCP 模式会话
 - 想看实时过程：先停 daemon，再 `claude --resume <sessionId>`（同一会话不要双写）
 
+#### 发送图片 / 文件
+
+daemon 模式没有 MCP reply 工具，assistant 回复文本里带本地文件标记即可让 daemon 上传并发送：
+
+| 标记 | 效果 |
+|------|------|
+| `[[image:/abs/shot.png]]` | 作为图片发送 |
+| `[[file:/abs/report.pdf]]` | 作为文件发送 |
+| `[[media:/abs/xxx]]` | 按扩展名自动判定图片 / 视频 / 文件 |
+| `![说明](/abs/shot.png)` | Markdown 图片语法，目标存在且是本地文件时也会发送 |
+
+- 路径支持绝对路径、`~/` 和相对路径（相对 daemon 的 cwd）；`file://` 前缀会自动去掉
+- 可以混在文本任意位置，也可一次带多个；标记会从文本中移除，先发文本再逐个发媒体
+- 文件不存在或上传失败时，daemon 会回一条文字提示，不会中断本轮回复
+- 视频文件同样走 `[[media:...]]`（按扩展名判定）
+
 systemd user service 示例（`cc-wechat-daemon.service`）：
 
 ```ini

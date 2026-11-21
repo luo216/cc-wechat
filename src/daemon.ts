@@ -13,13 +13,13 @@ import './proxy.js';
 
 import { spawn, type ChildProcess } from 'node:child_process';
 import readline from 'node:readline';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 
 import { getActiveAccount, loadSyncBuf, saveSyncBuf, getStateDir } from './store.js';
 import { getUpdates, sendMessage, sendTyping, getConfig } from './ilink-api.js';
 import { stripMarkdown, chunkText } from './text-utils.js';
-import { downloadMedia } from './cdn.js';
+import { uploadMedia, downloadMedia } from './cdn.js';
 import type { AccountData, WeixinMessage } from './types.js';
 import { MessageItemType } from './types.js';
 
@@ -269,12 +269,111 @@ class ClaudeRunner {
 }
 
 // ─── 回复微信 ─────────────────────────────────────────
+//
+// 除纯文本外，assistant 输出里可携带本地媒体，由 daemon 上传后发到微信：
+//   [[image:/abs/path.png]]   → 图片
+//   [[file:/abs/path.pdf]]    → 文件（按扩展名自动判定图片/视频/文件）
+//   [[media:/abs/path]]       → 同上（自动判定）
+// 也兼容 Markdown 图片语法（仅当目标路径存在且为本地文件时）：
+//   ![截图](/abs/path.png)
+
+interface OutgoingMedia {
+  path: string;
+  /** 原始标记，用于失败时提示 */
+  raw: string;
+}
+
+const MEDIA_MARKER_RE = /\[\[(?:image|img|file|media):([^\]]+)\]\]/gi;
+const MD_IMAGE_RE = /!\[[^\]]*\]\(([^)\s]+)\)/g;
+
+function normalizeMediaPath(raw: string): string {
+  let p = raw.trim().replace(/^["']|["']$/g, '');
+  if (p.startsWith('file://')) p = p.slice('file://'.length);
+  if (p.startsWith('~/')) p = join(process.env.HOME ?? '', p.slice(2));
+  return resolve(p);
+}
+
+function isLocalFile(p: string): boolean {
+  try {
+    return existsSync(p) && statSync(p).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/** 拆出文本里的媒体标记与 Markdown 本地图片；返回剩余文本与媒体列表（保持出现顺序） */
+function extractOutgoingMedia(text: string): { text: string; media: OutgoingMedia[] } {
+  const found: Array<{ index: number; media: OutgoingMedia }> = [];
+
+  for (const match of text.matchAll(MEDIA_MARKER_RE)) {
+    const rawPath = match[1] ?? '';
+    found.push({
+      index: match.index ?? 0,
+      media: { path: normalizeMediaPath(rawPath), raw: match[0] },
+    });
+  }
+
+  for (const match of text.matchAll(MD_IMAGE_RE)) {
+    const rawPath = match[1] ?? '';
+    const p = normalizeMediaPath(rawPath);
+    // Markdown 图片只在确为本地文件时升级为媒体；HTTP 链接保持原样（stripMarkdown 会去掉语法）
+    if (isLocalFile(p)) {
+      found.push({ index: match.index ?? 0, media: { path: p, raw: match[0] } });
+    }
+  }
+
+  found.sort((a, b) => a.index - b.index);
+
+  let rest = text;
+  for (const item of found) rest = rest.replace(item.media.raw, '');
+
+  return { text: rest, media: found.map((f) => f.media) };
+}
 
 function makeReplier(account: AccountData) {
   return async (ctx: TurnCtx, text: string): Promise<void> => {
-    const plain = stripMarkdown(text);
-    for (const chunk of chunkText(plain)) {
-      await sendMessage(account.token, ctx.userId, chunk, ctx.contextToken, account.baseUrl, ctx.refMsgId);
+    const { text: body, media } = extractOutgoingMedia(text);
+
+    const plain = stripMarkdown(body).trim();
+    if (plain) {
+      for (const chunk of chunkText(plain)) {
+        await sendMessage(account.token, ctx.userId, chunk, ctx.contextToken, account.baseUrl, ctx.refMsgId);
+      }
+    }
+
+    for (const item of media) {
+      if (!isLocalFile(item.path)) {
+        log(`[media] 跳过不存在的文件: ${item.path}`);
+        await sendMessage(
+          account.token,
+          ctx.userId,
+          `（媒体文件不存在，未发送: ${item.path}）`,
+          ctx.contextToken,
+          account.baseUrl,
+          ctx.refMsgId,
+        ).catch(() => {});
+        continue;
+      }
+      try {
+        await uploadMedia({
+          token: account.token,
+          toUser: ctx.userId,
+          contextToken: ctx.contextToken,
+          filePath: item.path,
+          baseUrl: account.baseUrl,
+        });
+        log(`[media] 已发送: ${item.path}`);
+      } catch (err) {
+        log(`[media] 发送失败: ${item.path}: ${String(err)}`);
+        await sendMessage(
+          account.token,
+          ctx.userId,
+          `（媒体发送失败: ${item.path}）`,
+          ctx.contextToken,
+          account.baseUrl,
+          ctx.refMsgId,
+        ).catch(() => {});
+      }
     }
   };
 }
