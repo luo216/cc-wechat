@@ -5,7 +5,7 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { apiFetch, buildHeaders, getUploadUrl, buildBaseInfo } from './ilink-api.js';
+import { apiFetch, assertApiOk, getUploadUrl, buildBaseInfo } from './ilink-api.js';
 
 const CDN_BASE_URL = 'https://novac2c.cdn.weixin.qq.com/c2c';
 
@@ -91,10 +91,8 @@ export async function uploadMedia(params: {
   // 3. 加密文件
   const ciphertext = encryptAesEcb(fileData, aesKey);
 
-  // 4. 构造 filekey
-  const extname = path.extname(filePath);
-  const rand = crypto.randomBytes(3).toString('hex');
-  const filekey = `cc-wechat-${Date.now()}-${rand}${extname}`;
+  // 4. 构造 filekey（与官方一致：16 字节随机数的 hex）
+  const filekey = crypto.randomBytes(16).toString('hex');
 
   // 5. 获取上传地址
   const uploadResp = await getUploadUrl(token, {
@@ -109,16 +107,22 @@ export async function uploadMedia(params: {
     base_info: buildBaseInfo(),
   }, baseUrl);
 
+  // 新版服务端返回 upload_full_url，旧版返回 upload_param（需客户端拼接）
+  const uploadFullUrl = uploadResp.upload_full_url?.trim();
   const uploadParam = uploadResp.upload_param ?? '';
-  const serverFilekey = uploadResp.filekey ?? filekey;
+  if (!uploadFullUrl && !uploadParam) {
+    throw new Error(
+      `[uploadMedia] getUploadUrl 未返回上传地址: ${JSON.stringify(uploadResp)}`,
+    );
+  }
 
   // 6. 上传到 CDN
-  const cdnUrl =
-    `${cdnBaseUrl ?? CDN_BASE_URL}/upload` +
-    `?encrypted_query_param=${encodeURIComponent(uploadParam)}` +
-    `&filekey=${encodeURIComponent(serverFilekey)}`;
+  const cdnUrl = uploadFullUrl
+    ? uploadFullUrl
+    : `${cdnBaseUrl ?? CDN_BASE_URL}/upload` +
+      `?encrypted_query_param=${encodeURIComponent(uploadParam)}` +
+      `&filekey=${encodeURIComponent(filekey)}`;
 
-  const authHeaders = buildHeaders(token);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 60_000);
 
@@ -127,7 +131,6 @@ export async function uploadMedia(params: {
     const cdnResp = await fetch(cdnUrl, {
       method: 'POST',
       headers: {
-        ...authHeaders,
         'Content-Type': 'application/octet-stream',
       },
       body: new Uint8Array(ciphertext) as unknown as BodyInit,
@@ -138,6 +141,11 @@ export async function uploadMedia(params: {
       throw new Error(`[uploadMedia] CDN HTTP ${cdnResp.status}: ${errText}`);
     }
     downloadParam = cdnResp.headers.get('x-encrypted-param') ?? '';
+    if (!downloadParam) {
+      throw new Error(
+        '[uploadMedia] CDN 响应缺少 x-encrypted-param，无法生成可下载的媒体引用',
+      );
+    }
   } finally {
     clearTimeout(timer);
   }
@@ -186,7 +194,7 @@ export async function uploadMedia(params: {
     base_info: buildBaseInfo(),
   });
 
-  await apiFetch({
+  const respText = await apiFetch({
     baseUrl,
     endpoint: 'ilink/bot/sendmessage',
     body,
@@ -194,6 +202,9 @@ export async function uploadMedia(params: {
     timeoutMs: 10_000,
     label: 'uploadMedia',
   });
+  // 媒体消息被服务端拒绝时通常也是 HTTP 200 + ret/errcode 非 0；
+  // 不校验会把失败当成功（daemon 日志里的“已发送”就是假的）。
+  assertApiOk('uploadMedia', respText);
 }
 
 // ─── 下载媒体 ─────────────────────────────────────────
@@ -213,13 +224,16 @@ export async function downloadMedia(params: {
   cdnBaseUrl?: string;
   outDir?: string;
   fileName?: string;
+  /** 新版协议服务端直接给出的完整下载 URL（优先使用） */
+  fullUrl?: string;
 }): Promise<string> {
-  const { encryptQueryParam, aesKeyBase64, cdnBaseUrl, outDir, fileName } = params;
+  const { encryptQueryParam, aesKeyBase64, cdnBaseUrl, outDir, fileName, fullUrl } = params;
 
-  // 1. 构造下载 URL
+  // 1. 构造下载 URL（新版协议带 full_url 时直接用）
   const downloadUrl =
+    fullUrl?.trim() ||
     `${cdnBaseUrl ?? CDN_BASE_URL}/download` +
-    `?encrypted_query_param=${encodeURIComponent(encryptQueryParam)}`;
+      `?encrypted_query_param=${encodeURIComponent(encryptQueryParam)}`;
 
   // 2. 下载密文
   const controller = new AbortController();

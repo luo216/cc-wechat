@@ -17,6 +17,8 @@ export interface CDNMedia {
   encrypt_query_param?: string;
   aes_key?: string;
   encrypt_type?: number;
+  /** 服务端直接给出的完整下载 URL（新版协议） */
+  full_url?: string;
 }
 
 // 消息内容项
@@ -75,7 +77,11 @@ export interface GetConfigResp {
 }
 
 export interface GetUploadUrlResp {
+  ret?: number;
+  errcode?: number;
+  errmsg?: string;
   upload_param?: string;
+  upload_full_url?: string;
   thumb_upload_param?: string;
   filekey?: string;
 }

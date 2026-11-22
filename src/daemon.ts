@@ -85,11 +85,13 @@ async function extractText(msg: WeixinMessage): Promise<string> {
       }
     } else if (t === MessageItemType.IMAGE) {
       let desc = '[图片]';
-      if (item.image_item?.media?.encrypt_query_param && item.image_item?.media?.aes_key) {
+      const media = item.image_item?.media;
+      if ((media?.encrypt_query_param || media?.full_url) && media?.aes_key) {
         try {
           const filePath = await downloadMedia({
-            encryptQueryParam: item.image_item.media.encrypt_query_param,
-            aesKeyBase64: item.image_item.media.aes_key,
+            encryptQueryParam: media.encrypt_query_param ?? '',
+            aesKeyBase64: media.aes_key,
+            fullUrl: media.full_url,
           });
           desc += `\n[附件: ${filePath}]`;
         } catch { /* 下载失败不阻塞 */ }
@@ -99,12 +101,14 @@ async function extractText(msg: WeixinMessage): Promise<string> {
       parts.push(`[语音] ${item.voice_item?.text ?? ''}`);
     } else if (t === MessageItemType.FILE) {
       let desc = `[文件: ${item.file_item?.file_name ?? 'unknown'}]`;
-      if (item.file_item?.media?.encrypt_query_param && item.file_item?.media?.aes_key) {
+      const media = item.file_item?.media;
+      if ((media?.encrypt_query_param || media?.full_url) && media?.aes_key) {
         try {
           const filePath = await downloadMedia({
-            encryptQueryParam: item.file_item.media.encrypt_query_param,
-            aesKeyBase64: item.file_item.media.aes_key,
-            fileName: item.file_item.file_name,
+            encryptQueryParam: media.encrypt_query_param ?? '',
+            aesKeyBase64: media.aes_key,
+            fileName: item.file_item?.file_name,
+            fullUrl: media.full_url,
           });
           desc += `\n[附件: ${filePath}]`;
         } catch { /* 下载失败不阻塞 */ }

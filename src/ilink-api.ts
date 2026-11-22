@@ -16,9 +16,16 @@ export const DEFAULT_BASE_URL = 'https://ilinkai.weixin.qq.com';
 const DEFAULT_BOT_TYPE = '3';
 const LONG_POLL_TIMEOUT_MS = 35_000;
 
+// 与官方 @tencent-weixin/openclaw-weixin 2.4.10 对齐。
+// 服务端会按 client version 选择协议分支（>=2.x 返回 upload_full_url，
+// 旧版返回 upload_param），媒体消息也依赖当前 client 标识。
+const CHANNEL_VERSION = '2.4.10';
+const ILINK_APP_ID = 'bot';
+const ILINK_APP_CLIENT_VERSION = '131082'; // 0x00_02_04_0A = 2.4.10
+
 /** 构造 base_info 通用字段 */
 export function buildBaseInfo(): BaseInfo {
-  return { channel_version: '0.1.0' };
+  return { channel_version: CHANNEL_VERSION };
 }
 
 /** 生成随机 wechat uin（4 字节随机数 → 十进制 → base64） */
@@ -37,6 +44,8 @@ export function buildHeaders(
     'Content-Type': 'application/json',
     'AuthorizationType': 'ilink_bot_token',
     'X-WECHAT-UIN': randomWechatUin(),
+    'iLink-App-Id': ILINK_APP_ID,
+    'iLink-App-ClientVersion': ILINK_APP_CLIENT_VERSION,
   };
   if (token) {
     headers['Authorization'] = `Bearer ${token}`;
@@ -45,6 +54,26 @@ export function buildHeaders(
     headers['Content-Length'] = String(Buffer.byteLength(body, 'utf-8'));
   }
   return headers;
+}
+
+/**
+ * 校验 iLink API 响应体。服务端的失败经常以 HTTP 200 + `{ret/errcode: 非0}`
+ * 返回（例如 sendmessage 参数不合法时 ret=-3），只看 HTTP 状态会把失败当成功。
+ */
+export function assertApiOk(label: string, text: string): void {
+  if (!text.trim()) return;
+  let resp: { ret?: number; errcode?: number; errmsg?: string };
+  try {
+    resp = JSON.parse(text) as { ret?: number; errcode?: number; errmsg?: string };
+  } catch {
+    return; // 非 JSON 响应交由调用方处理
+  }
+  const code = resp.ret ?? resp.errcode;
+  if (code !== undefined && code !== 0) {
+    throw new Error(
+      `[${label}] ret=${resp.ret ?? '-'} errcode=${resp.errcode ?? '-'} errmsg=${resp.errmsg ?? ''}`,
+    );
+  }
 }
 
 /** 通用 HTTP 请求 */
@@ -79,6 +108,8 @@ export async function apiFetch(params: {
     ? {
         'AuthorizationType': 'ilink_bot_token',
         'X-WECHAT-UIN': randomWechatUin(),
+        'iLink-App-Id': ILINK_APP_ID,
+        'iLink-App-ClientVersion': ILINK_APP_CLIENT_VERSION,
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
       }
     : buildHeaders(token, body);
@@ -206,7 +237,7 @@ export async function sendMessage(
     msg.ref_message_id = refMsgId;
   }
   const body = JSON.stringify({ msg, base_info: buildBaseInfo() });
-  await apiFetch({
+  const respText = await apiFetch({
     baseUrl,
     endpoint: 'ilink/bot/sendmessage',
     body,
@@ -214,6 +245,7 @@ export async function sendMessage(
     timeoutMs: 10_000,
     label: 'sendMessage',
   });
+  assertApiOk('sendMessage', respText);
   return clientId;
 }
 
@@ -226,9 +258,9 @@ export async function sendTyping(
   baseUrl?: string,
 ): Promise<void> {
   const body = JSON.stringify({
-    user_id: userId,
+    ilink_user_id: userId,
     typing_ticket: ticket,
-    typing_status: status,
+    status,
     base_info: buildBaseInfo(),
   });
   await apiFetch({
@@ -249,7 +281,7 @@ export async function getConfig(
   baseUrl?: string,
 ): Promise<GetConfigResp> {
   const body = JSON.stringify({
-    user_id: userId,
+    ilink_user_id: userId,
     ...(contextToken ? { context_token: contextToken } : {}),
     base_info: buildBaseInfo(),
   });
@@ -282,5 +314,6 @@ export async function getUploadUrl(
     timeoutMs: 10_000,
     label: 'getUploadUrl',
   });
+  assertApiOk('getUploadUrl', text);
   return JSON.parse(text) as GetUploadUrlResp;
 }
