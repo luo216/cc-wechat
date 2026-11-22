@@ -22,6 +22,7 @@ import { stripMarkdown, chunkText } from './text-utils.js';
 import { uploadMedia, downloadMedia } from './cdn.js';
 import type { AccountData, WeixinMessage } from './types.js';
 import { MessageItemType } from './types.js';
+import { TurnMapper } from './turn-mapper.js';
 
 const SESSION_FILE = 'claude-session.json';
 const SESSION_EXPIRED_ERRCODE = -14;
@@ -137,11 +138,15 @@ type Json = Record<string, unknown>;
  */
 class ClaudeRunner {
   private child: ChildProcess | null = null;
-  private turns: TurnCtx[] = [];
-  private textBuffer: string[] = [];
+  private mapper = new TurnMapper<TurnCtx>();
+  private lastEventAt = Date.now();
+  private idleTimer: NodeJS.Timeout | null = null;
   private sessionId: string | undefined;
   private stopping = false;
   private restartTimer: NodeJS.Timeout | null = null;
+
+  /** 回合挂起但长时间没有任何事件时，兜底发送已生成的文本 */
+  private static readonly IDLE_FLUSH_MS = 120_000;
 
   constructor(
     private readonly cwd: string,
@@ -151,6 +156,16 @@ class ClaudeRunner {
 
   start(): void {
     this.stopping = false;
+    if (!this.idleTimer) {
+      this.idleTimer = setInterval(() => {
+        if (Date.now() - this.lastEventAt < ClaudeRunner.IDLE_FLUSH_MS) return;
+        const out = this.mapper.flushIdle();
+        if (!out) return;
+        log('[claude] result timeout, flushing buffered text');
+        void this.onReply(out.ctx, out.text).catch((err) => log('[reply] failed:', String(err)));
+      }, 5_000);
+      this.idleTimer.unref?.();
+    }
     const saved = loadSession();
     const resumeId = saved?.cwd === this.cwd ? saved.sessionId : undefined;
 
@@ -199,7 +214,7 @@ class ClaudeRunner {
       void this.onReply(ctx, 'Claude 进程未就绪，请稍后重试').catch(() => {});
       return;
     }
-    this.turns.push(ctx);
+    this.mapper.enqueue(ctx);
     const payload = { type: 'user', message: { role: 'user', content: [{ type: 'text', text }] } };
     this.child.stdin?.write(JSON.stringify(payload) + '\n');
   }
@@ -212,6 +227,7 @@ class ClaudeRunner {
       return;
     }
 
+    this.lastEventAt = Date.now();
     const type = ev.type;
 
     if (type === 'system' && ev.subtype === 'init') {
@@ -224,33 +240,17 @@ class ClaudeRunner {
       return;
     }
 
-    if (type === 'assistant') {
-      const message = ev.message as Json | undefined;
-      const content = message?.content;
-      if (Array.isArray(content)) {
-        for (const block of content as Json[]) {
-          if (block.type === 'text' && typeof block.text === 'string') {
-            this.textBuffer.push(block.text);
-          }
-        }
-      }
+    const out = this.mapper.ingest(ev);
+    if (out.ignoredBackground) {
+      log('[claude] background task result ignored');
       return;
     }
-
-    if (type === 'result') {
-      const ctx = this.turns.shift();
-      let text = this.textBuffer.join('\n').trim();
-      this.textBuffer = [];
-      if (!text) {
-        const resultText = typeof ev.result === 'string' ? ev.result : '';
-        const cmd = typeof ev.local_command === 'string' ? ev.local_command : '';
-        text = resultText.trim() || (cmd ? `已执行 /${cmd}` : '（无输出）');
-      }
-      if (!ctx) {
-        log('[claude] result without pending turn, dropped');
-        return;
-      }
-      void this.onReply(ctx, text).catch((err) => log('[reply] failed:', String(err)));
+    if (out.droppedOrphan) {
+      log('[claude] result without pending turn, dropped');
+      return;
+    }
+    if (out.reply) {
+      void this.onReply(out.reply.ctx, out.reply.text).catch((err) => log('[reply] failed:', String(err)));
     }
   }
 
@@ -263,6 +263,10 @@ class ClaudeRunner {
     if (this.restartTimer) {
       clearTimeout(this.restartTimer);
       this.restartTimer = null;
+    }
+    if (this.idleTimer) {
+      clearInterval(this.idleTimer);
+      this.idleTimer = null;
     }
     this.child?.kill('SIGTERM');
   }
